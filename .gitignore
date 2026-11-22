@@ -11,3 +11,5 @@ wheels/
 
 # Environment Variables
 .env
+# Claude Code notes (tutor state, roadmap, Q&A)
+.claude/
