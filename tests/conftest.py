@@ -1,0 +1,124 @@
+import os
+
+# load env variables before imports
+os.environ["WEBHOOK_SECRET"] = "test-secret"
+os.environ["GITHUB_TOKEN"] = "test-token"
+
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from reviewer.ingest import webhook  # noqa: E402
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+@pytest.fixture
+def webhook_secret() -> bytes:
+    """The TEST webhook secret as bytes, the same value the app loaded at import.
+
+    Set at the top of this file, before the app is imported, because
+    `settings = Settings()` reads the environment only once.
+    """
+    return os.environ["WEBHOOK_SECRET"].encode()
+
+@pytest.fixture
+def client() -> TestClient:
+    """An in-process HTTP client for the FastAPI app (no real server or network).
+
+    TestClient runs background tasks before `post()` returns, so tests can check
+    what the task did right after the call.
+    """
+    return TestClient(webhook.app)
+
+# runs this fixture before every test automatically without having to pass it as an argument
+@pytest.fixture(autouse=True)
+def _clear_deliveries():
+    """Reset the module-level dedupe set around every test (autouse).
+
+    `PROCESSED_DELIVERIES` lives on the module and survives between tests.
+    Without this reset, a delivery ID used in one test would make a later test
+    see "Duplicate delivery ignored", and tests would depend on their run order.
+    """
+    webhook.PROCESSED_DELIVERIES.clear() # runs during set (before the test)
+    yield
+    webhook.PROCESSED_DELIVERIES.clear() # runs after the test 
+
+@pytest.fixture
+def load_fixture():
+    """Factory fixture: returns `_load(name) -> bytes` for files in tests/fixtures/.
+
+    `_load("ping")` and `_load("ping.json")` both work. It returns raw bytes,
+    because the signature covers exact bytes; `json.loads` them yourself when you
+    need values or a modified variant. The path is resolved from this file, so
+    pytest works from any directory.
+    """
+    def _load(name: str) -> bytes:
+        # appends .json to file name if it doesn't already have it 
+        filename = name if name.endswith(".json") else f"{name}.json"
+        return (FIXTURES_DIR / filename).read_bytes()
+    return _load
+
+@pytest.fixture
+def sign(webhook_secret):
+    """Factory fixture: returns `_sign(body, secret=None) -> "sha256=<hex>"`.
+
+    It computes the `X-Hub-Signature-256` value the way GitHub does: HMAC-SHA256
+    of the raw body, as lowercase hex. By default it uses the test secret, so the
+    app accepts the result. Pass `secret=b"..."` to forge one the app must reject.
+    This is how saved fixtures get valid signatures without the real secret.
+    """
+    def _sign(body: bytes, secret: bytes | None = None) -> str:
+        _secret = webhook_secret if secret is None else secret  # bytes either way
+        digest = hmac.new(_secret, body, hashlib.sha256).hexdigest()
+        return f"sha256={digest}"
+    return _sign
+
+@pytest.fixture
+def post_webhook(client, sign):
+    """Factory fixture: returns `_post(event, body, ...)`, which POSTs to /webhook/github like GitHub.
+
+    It sets `X-GitHub-Event`, `X-GitHub-Delivery` and (unless told not to)
+    `X-Hub-Signature-256`, and sends `body` byte-for-byte (`content=`, not
+    `json=`), so the bytes signed are the bytes sent.
+
+        _post(event, body)                          signed with the test secret
+        _post(event, body, signed=False)            no signature header
+        _post(event, body, secret=b"wrong")         signed with another secret
+        _post(event, body, signature="sha256=...")  this exact header (tampering tests)
+        _post(event, body, delivery="d-1")          choose the delivery ID (dedupe tests)
+
+    Returns the client's response (`.status_code`, `.json()`).
+    """
+    def _post(event: str, body: bytes, delivery: str = "test-delivery", signed: bool = True, secret: bytes | None = None, signature: str | None = None,):
+        headers = {
+            "X-GitHub-Event": event,
+            "X-GitHub-Delivery": delivery,
+        }
+        if signature is not None:
+            headers["X-Hub-Signature-256"] = signature
+        elif signed:
+            headers["X-Hub-Signature-256"] = sign(body, secret=secret)
+
+        return client.post("/webhook/github", content=body, headers=headers)
+    return _post
+
+@pytest.fixture
+def queued(monkeypatch) -> list:
+    """Replace the background task with a recorder; returns the list of recorded calls.
+
+    It patches `webhook.process_pull_request`, which works because the endpoint
+    looks the name up on the module each time it runs (patch where it's looked
+    up). Each call's args are appended as a tuple, so tests assert `queued == []`
+    (nothing queued) or `queued == [(delivery, repo, number, sha)]`. monkeypatch
+    undoes the patch after each test. Don't use it in dedupe tests, which need
+    the real task.
+    """
+    calls = []
+    def fake(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(webhook, "process_pull_request", fake) # module level patching
+    return calls
