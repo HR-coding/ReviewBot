@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     github_token: SecretStr
     webhook_secret: SecretStr
+    gemini_api_key: SecretStr = SecretStr("")
     anthropic_api_key: SecretStr = SecretStr("")
 
     model_config = SettingsConfigDict(
