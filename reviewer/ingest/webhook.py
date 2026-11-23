@@ -1,18 +1,19 @@
 from reviewer.ingest.signature import verify_github_signature
+from reviewer.ingest.github_client import GitHubClient, GitHubAPIError
 from reviewer.config import settings
 from reviewer.ingest.events import PREvent
+from reviewer.diff.parser import summarize_diff
 
 import logging
 from fastapi import FastAPI, Request, Response, status, BackgroundTasks, Header, HTTPException
 from pydantic import ValidationError
 
-GITHUB_WEBHOOK_SECRET = settings.webhook_secret
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Only these pull_request actions change the code, so only these need a review.
+# Allowed list of actions 
 ALLOWED_ACTIONS = {"opened", "synchronize", "reopened"}
+
 
 # In memory cache to store the processed github requests (storing the delivery ids)
 PROCESSED_DELIVERIES : set[str] = set()
@@ -20,7 +21,7 @@ PROCESSED_DELIVERIES : set[str] = set()
 app = FastAPI()
 
 
-def process_pull_request(delivery_id: str, repo: str, pr_number: int, head_sha: str) -> None:
+async def process_pull_request(delivery_id: str, repo: str, pr_number: int, head_sha: str) -> None:
     '''Background task: review one PR at one commit.
 
     It receives only the three values the review needs, already validated by the
@@ -40,11 +41,31 @@ def process_pull_request(delivery_id: str, repo: str, pr_number: int, head_sha: 
         return
     PROCESSED_DELIVERIES.add(delivery_id)
 
+    # On ANY failure, un-mark the delivery so a GitHub "Redeliver" is retried
+    # instead of being dropped as a duplicate.
     try:
         logger.info("[%s] Reviewing %s#%s at %s", delivery_id, repo, pr_number, head_sha[:7])
-        # MVP-3: diff = get_pr_diff(repo, pr_number)
-        # MVP-4: review = review_diff(diff); post_comment(repo, pr_number, review)
+        token = settings.github_token.get_secret_value()
+        async with GitHubClient(token=token) as gh:
+            diff = await gh.get_pr_diff(repo=repo, number=pr_number)
+            
+            files, additions, deletions = summarize_diff(diff=diff)
+            review = (
+                f"### PR Summary (`{head_sha[:7]}`)\n" 
+                f"- **Files changed:** {files}\n" 
+                f"- **Lines:** +{additions} / -{deletions}"
+            )
+            
+            comment_url = await gh.post_comment(repo=repo, number=pr_number, body=review)
+        logger.info("[%s] Posted comment on %s#%s: %s", delivery_id, repo, pr_number, comment_url)
+
+    except GitHubAPIError as exc:
+        # Expected failure (bad token, 404, GitHub down): one clear line, no traceback.
+        PROCESSED_DELIVERIES.discard(delivery_id)
+        logger.error("[%s] GitHub API failed (status=%s): %s", delivery_id, exc.status_code, exc.message)
+
     except Exception:
+        # Unexpected failure = a bug in our code: log the full traceback.
         PROCESSED_DELIVERIES.discard(delivery_id)
         logger.exception("[%s] Error while processing pull request", delivery_id)
 
@@ -65,7 +86,7 @@ async def process_github_webhook(request: Request, response: Response, backgroun
     raw_body = await request.body()
 
     # 1. Verify the HMAC signature before doing anything else.
-    if not verify_github_signature(GITHUB_WEBHOOK_SECRET.get_secret_value().encode(), raw_body, x_hub_signature_256):
+    if not verify_github_signature(settings.webhook_secret.get_secret_value().encode(), raw_body, x_hub_signature_256):
         logger.warning(
             "[%s] Rejected webhook with invalid signature (event=%s)",
             x_github_delivery,
