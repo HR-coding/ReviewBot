@@ -2,7 +2,7 @@ from reviewer.ingest.signature import verify_github_signature
 from reviewer.ingest.github_client import GitHubClient, GitHubAPIError
 from reviewer.config import settings
 from reviewer.ingest.events import PREvent
-from reviewer.diff.parser import summarize_diff
+from reviewer.agent.nodes import review_diff, ReviewError
 
 import logging
 from fastapi import FastAPI, Request, Response, status, BackgroundTasks, Header, HTTPException
@@ -47,17 +47,15 @@ async def process_pull_request(delivery_id: str, repo: str, pr_number: int, head
         logger.info("[%s] Reviewing %s#%s at %s", delivery_id, repo, pr_number, head_sha[:7])
         token = settings.github_token.get_secret_value()
         async with GitHubClient(token=token) as gh:
-            diff = await gh.get_pr_diff(repo=repo, number=pr_number)
-            
-            files, additions, deletions = summarize_diff(diff=diff)
-            review = (
-                f"### PR Summary (`{head_sha[:7]}`)\n" 
-                f"- **Files changed:** {files}\n" 
-                f"- **Lines:** +{additions} / -{deletions}"
-            )
-            
-            comment_url = await gh.post_comment(repo=repo, number=pr_number, body=review)
+            diff = await gh.get_pr_diff(repo=repo, number=pr_number)            
+            review = await review_diff(diff=diff)
+            comment_url = await gh.post_comment(repo=repo, number=pr_number, body=f"### 🤖 Review of {head_sha[:7]}\n\n{review}")
         logger.info("[%s] Posted comment on %s#%s: %s", delivery_id, repo, pr_number, comment_url)
+
+    except ReviewError as exc:
+        # LLM review failure due to rate limit issues etc
+        PROCESSED_DELIVERIES.discard(delivery_id)
+        logger.error("[%s]LLM Review Failed (status=%s): %s", delivery_id, exc.status_code, exc.message)
 
     except GitHubAPIError as exc:
         # Expected failure (bad token, 404, GitHub down): one clear line, no traceback.
