@@ -208,6 +208,7 @@ def gemini_server(monkeypatch):
     real = nodes._http_options()
 
     def fast_options() -> types.HttpOptions:
+        assert real.retry_options is not None
         retry = real.retry_options.model_copy(update={"initial_delay": 0.001, "max_delay": 0.002, "jitter": 0})
         return types.HttpOptions(
             timeout=real.timeout,
