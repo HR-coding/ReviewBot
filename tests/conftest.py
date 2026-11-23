@@ -3,6 +3,10 @@ import os
 # load env variables before imports
 os.environ["WEBHOOK_SECRET"] = "test-secret"
 os.environ["GITHUB_TOKEN"] = "test-token"
+# Never let tests see the real Gemini key from .env: a test that forgets to patch
+# the LLM then fails safely instead of spending quota and sending code to Google.
+os.environ["GEMINI_API_KEY"] = "test-gemini-key"
+os.environ["GEMINI_MODEL"] = "test-model"
 
 import hashlib  # noqa: E402
 import hmac  # noqa: E402
@@ -154,4 +158,36 @@ class FakeGitHubClient:
 def fake_github(monkeypatch) -> FakeGitHubClient:
     fake = FakeGitHubClient()
     monkeypatch.setattr(webhook, "GitHubClient", fake)
+    return fake
+
+
+class FakeReview:
+    """Stand-in for `review_diff`: records each diff it gets, returns a canned review.
+
+    Set `error_to_raise` to make it fail like the real one would (e.g. a
+    `ReviewError` for a Gemini rate limit).
+    """
+
+    def __init__(self) -> None:
+        self.review_to_return = "FAKE REVIEW"
+        self.error_to_raise: Exception | None = None
+        self.diffs_reviewed: list[str] = []
+
+    async def __call__(self, diff: str) -> str:
+        # async, because the task does `await review_diff(diff=...)`
+        self.diffs_reviewed.append(diff)
+        if self.error_to_raise is not None:
+            raise self.error_to_raise
+        return self.review_to_return
+
+
+@pytest.fixture
+def fake_review(monkeypatch) -> FakeReview:
+    """Replace `webhook.review_diff` with a FakeReview, so no test calls Gemini.
+
+    Patched on `webhook` because that's where the task looks the name up
+    (`from reviewer.agent.nodes import review_diff` copied it there).
+    """
+    fake = FakeReview()
+    monkeypatch.setattr(webhook, "review_diff", fake)
     return fake

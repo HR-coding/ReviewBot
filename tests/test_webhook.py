@@ -5,6 +5,7 @@ from typing import Any
 from collections.abc import Callable
 
 from reviewer.ingest import webhook
+from reviewer.agent.nodes import ReviewError
 from reviewer.ingest.github_client import GitHubAPIError
 
 def modified(body: bytes, change: Callable[[dict[str, Any]], None]) -> bytes:
@@ -220,14 +221,15 @@ class TestDeduplication:
     - A delivery whose task FAILED is un-marked, so a redelivery is retried.
 
     Uses the REAL `process_pull_request` (not `queued`) with `fake_github` in
-    place of `GitHubClient`, so no request reaches GitHub. Dedupe happens after
+    place of `GitHubClient` and `fake_review` in place of `review_diff`, so no
+    request reaches GitHub or Gemini. Dedupe happens after
     the response is sent, so the endpoint answers "queued" both times; only the
     logs and the fake's recorded comments show the difference. The asserts count
     lines only the task produces (`"[id] Reviewing"`), because the endpoint's own
     "Queued" line also contains the delivery ID.
     """
 
-    def test_duplicate_delivery_is_ignored(self, post_webhook, opened, caplog, fake_github):
+    def test_duplicate_delivery_is_ignored(self, post_webhook, opened, caplog, fake_github, fake_review):
         caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
         delivery = "deliv-w17"
 
@@ -246,7 +248,7 @@ class TestDeduplication:
         # The side effect that matters: exactly one comment on the PR.
         assert len(fake_github.comments_posted) == 1
 
-    def test_distinct_deliveries_both_process(self, post_webhook, opened, caplog, fake_github):
+    def test_distinct_deliveries_both_process(self, post_webhook, opened, caplog, fake_github, fake_review):
         caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
         delivery_1 = "deliv-w18-a"
         delivery_2 = "deliv-w18-b"  # must differ, or this is W17 again
@@ -260,7 +262,7 @@ class TestDeduplication:
         assert count_logs(caplog, "Duplicate delivery ignored") == 0
         assert len(fake_github.comments_posted) == 2
 
-    def test_failed_delivery_is_retried(self, post_webhook, opened, caplog, fake_github):
+    def test_failed_delivery_is_retried(self, post_webhook, opened, caplog, fake_github, fake_review):
         # GitHub's API fails → the task must un-mark the delivery ID, so when
         # GitHub (or you, via "Redeliver") sends the same delivery again, it runs again.
         caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
@@ -279,22 +281,41 @@ class TestDeduplication:
 
 
 class TestPostedComment:
-    """What the task posts: the placeholder summary, on the right PR.
+    """What the task does with the diff and the review.
 
-    The fake returns a known diff (`FakeGitHubClient.diff_to_return`: 1 file,
-    1 added line), so the expected counts are exact. The repo, number and sha
-    are read from the payload, not hard-coded.
+    The fetched diff goes to `review_diff` unchanged, and the LLM's review is
+    what gets posted, on the right PR, with the short sha of the reviewed commit.
+    If the review fails, nothing is posted and the delivery stays retryable.
+    Uses `fake_github` + `fake_review`, so it's fully offline.
     """
 
-    def test_posts_summary_on_the_pr(self, post_webhook, opened, fake_github):
+    def test_posts_review_on_the_pr(self, post_webhook, opened, fake_github, fake_review):
+        # W20
         payload = json.loads(opened)
 
         post_webhook("pull_request", opened, delivery="deliv-w20")
 
+        # The diff fetched from GitHub is exactly what the LLM reviewed.
+        assert fake_review.diffs_reviewed == [fake_github.diff_to_return]
+        # The LLM's output is what was posted, on this PR, labelled with the commit.
         assert len(fake_github.comments_posted) == 1
         repo, number, body = fake_github.comments_posted[0]
         assert repo == payload["repository"]["full_name"]
         assert number == payload["number"]
+        assert fake_review.review_to_return in body
         assert payload["pull_request"]["head"]["sha"][:7] in body
-        assert "**Files changed:** 1" in body
-        assert "+1 / -0" in body
+
+    def test_failed_review_posts_nothing_and_is_retried(self, post_webhook, opened, caplog, fake_github, fake_review):
+        # W21: e.g. Gemini's free tier returns 429 → no comment, and Redeliver retries.
+        caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
+        fake_review.error_to_raise = ReviewError("rate limited", status_code=429)
+        delivery = "deliv-w21"
+
+        post_webhook("pull_request", opened, delivery=delivery)
+        post_webhook("pull_request", opened, delivery=delivery)  # the redelivery
+
+        assert count_logs(caplog, f"[{delivery}] Reviewing") == 2
+        assert count_logs(caplog, f"[{delivery}] Duplicate delivery ignored") == 0
+        assert count_logs(caplog, "status=429") == 2
+        assert fake_github.comments_posted == []
+        assert delivery not in webhook.PROCESSED_DELIVERIES
