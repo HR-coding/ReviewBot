@@ -4,6 +4,9 @@ import logging
 from typing import Any
 from collections.abc import Callable
 
+from reviewer.ingest import webhook
+from reviewer.ingest.github_client import GitHubAPIError
+
 def modified(body: bytes, change: Callable[[dict[str, Any]], None]) -> bytes:
     """Parse JSON bytes, mutate the dict via `change(data)`, and re-encode."""
     data = json.loads(body)
@@ -211,18 +214,20 @@ class TestValidation:
 class TestDeduplication:
     """The background task processes each `X-GitHub-Delivery` ID at most once.
 
-    - Same delivery twice → reviewed once, then "Duplicate delivery ignored".
+    - Same delivery twice → reviewed and posted once, then "Duplicate delivery ignored".
     - Same payload under two different delivery IDs → reviewed twice (dedupe is
       per delivery, not per PR).
+    - A delivery whose task FAILED is un-marked, so a redelivery is retried.
 
-    Uses the REAL `process_pull_request` (not `queued`) and checks its log lines
-    with caplog. Dedupe happens after the response is sent, so the endpoint
-    answers "queued" both times; only the logs show the difference. The asserts
-    count lines only the task produces (`"[id] Reviewing"`), because the
-    endpoint's own "Queued" line also contains the delivery ID.
+    Uses the REAL `process_pull_request` (not `queued`) with `fake_github` in
+    place of `GitHubClient`, so no request reaches GitHub. Dedupe happens after
+    the response is sent, so the endpoint answers "queued" both times; only the
+    logs and the fake's recorded comments show the difference. The asserts count
+    lines only the task produces (`"[id] Reviewing"`), because the endpoint's own
+    "Queued" line also contains the delivery ID.
     """
 
-    def test_duplicate_delivery_is_ignored(self, post_webhook, opened, caplog):
+    def test_duplicate_delivery_is_ignored(self, post_webhook, opened, caplog, fake_github):
         caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
         delivery = "deliv-w17"
 
@@ -238,8 +243,10 @@ class TestDeduplication:
         # contains the delivery ID, so "contains the ID" would prove nothing).
         assert count_logs(caplog, f"[{delivery}] Reviewing") == 1
         assert count_logs(caplog, f"[{delivery}] Duplicate delivery ignored") == 1
+        # The side effect that matters: exactly one comment on the PR.
+        assert len(fake_github.comments_posted) == 1
 
-    def test_distinct_deliveries_both_process(self, post_webhook, opened, caplog):
+    def test_distinct_deliveries_both_process(self, post_webhook, opened, caplog, fake_github):
         caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
         delivery_1 = "deliv-w18-a"
         delivery_2 = "deliv-w18-b"  # must differ, or this is W17 again
@@ -251,3 +258,43 @@ class TestDeduplication:
         assert count_logs(caplog, f"[{delivery_1}] Reviewing") == 1
         assert count_logs(caplog, f"[{delivery_2}] Reviewing") == 1
         assert count_logs(caplog, "Duplicate delivery ignored") == 0
+        assert len(fake_github.comments_posted) == 2
+
+    def test_failed_delivery_is_retried(self, post_webhook, opened, caplog, fake_github):
+        # GitHub's API fails → the task must un-mark the delivery ID, so when
+        # GitHub (or you, via "Redeliver") sends the same delivery again, it runs again.
+        caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
+        fake_github.error_to_raise = GitHubAPIError("server error", 500)
+        delivery = "deliv-w19"
+
+        post_webhook("pull_request", opened, delivery=delivery)
+        post_webhook("pull_request", opened, delivery=delivery)  # the redelivery
+
+        # Both attempts got past the dedupe check: the ID was discarded after attempt 1.
+        assert count_logs(caplog, f"[{delivery}] Reviewing") == 2
+        assert count_logs(caplog, f"[{delivery}] Duplicate delivery ignored") == 0
+        assert count_logs(caplog, f"[{delivery}] GitHub API failed (status=500)") == 2
+        assert fake_github.comments_posted == []  # the diff fetch failed, so nothing posted
+        assert delivery not in webhook.PROCESSED_DELIVERIES
+
+
+class TestPostedComment:
+    """What the task posts: the placeholder summary, on the right PR.
+
+    The fake returns a known diff (`FakeGitHubClient.diff_to_return`: 1 file,
+    1 added line), so the expected counts are exact. The repo, number and sha
+    are read from the payload, not hard-coded.
+    """
+
+    def test_posts_summary_on_the_pr(self, post_webhook, opened, fake_github):
+        payload = json.loads(opened)
+
+        post_webhook("pull_request", opened, delivery="deliv-w20")
+
+        assert len(fake_github.comments_posted) == 1
+        repo, number, body = fake_github.comments_posted[0]
+        assert repo == payload["repository"]["full_name"]
+        assert number == payload["number"]
+        assert payload["pull_request"]["head"]["sha"][:7] in body
+        assert "**Files changed:** 1" in body
+        assert "+1 / -0" in body

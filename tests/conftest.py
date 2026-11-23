@@ -122,3 +122,36 @@ def queued(monkeypatch) -> list:
 
     monkeypatch.setattr(webhook, "process_pull_request", fake) # module level patching
     return calls
+
+
+class FakeGitHubClient:
+    def __init__(self) -> None:
+        self.diff_to_return = "diff --git a/a.py b/a.py\n+new line\n"
+        self.error_to_raise: Exception | None = None
+        self.comments_posted: list[tuple[str, int, str]] = []
+
+    def __call__(self, token: str, **kwargs) -> "FakeGitHubClient":
+        # Allows FakeGitHubClient instance to act as the GitHubClient(...) constructor
+        return self
+
+    async def __aenter__(self) -> "FakeGitHubClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+    async def get_pr_diff(self, repo: str, number: int) -> str:
+        if self.error_to_raise is not None:
+            raise self.error_to_raise
+        return self.diff_to_return
+
+    async def post_comment(self, repo: str, number: int, body: str) -> str:
+        self.comments_posted.append((repo, number, body))
+        return f"https://github.com/{repo}/pull/{number}#issuecomment-1"
+
+
+@pytest.fixture
+def fake_github(monkeypatch) -> FakeGitHubClient:
+    fake = FakeGitHubClient()
+    monkeypatch.setattr(webhook, "GitHubClient", fake)
+    return fake
