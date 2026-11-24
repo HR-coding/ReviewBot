@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 
-import httpx
 import httpx2
 import pytest
 from google.genai import errors, types
@@ -140,7 +139,8 @@ class TestReviewDiff:
         assert exc_info.value.__cause__ is fake_gemini.error
 
     async def test_network_error_becomes_review_error(self, fake_gemini):
-        fake_gemini.error = httpx.ConnectError("down")
+        # The SDK's HTTP layer is httpx2, so that's what a real outage raises.
+        fake_gemini.error = httpx2.ConnectError("down")
 
         with pytest.raises(ReviewError) as exc_info:
             await review_diff(DIFF)
@@ -165,6 +165,14 @@ class TestReviewDiff:
             await review_diff(DIFF)
 
         assert fake_gemini.calls == []
+
+    async def test_bug_in_our_code_is_not_disguised_as_review_error(self, fake_gemini):
+        # R15: only network errors become ReviewError. A programming error must
+        # propagate, so the task logs it with a full traceback.
+        fake_gemini.error = AttributeError("'NoneType' object has no attribute 'x'")
+
+        with pytest.raises(AttributeError):
+            await review_diff(DIFF)
 
     async def test_key_never_logged(self, fake_gemini, caplog):
         fake_gemini.error = gemini_error(429, "Quota exceeded")
@@ -228,11 +236,15 @@ class TestRetryConfig:
         opts = nodes._http_options()
 
         assert opts.timeout == nodes.TIMEOUT_SECONDS * 1000  # milliseconds
-        assert opts.retry_options.attempts == nodes.RETRY_ATTEMPTS > 1
+        retry_options = opts.retry_options
+        assert retry_options is not None
+        assert retry_options.attempts == nodes.RETRY_ATTEMPTS > 1
+        codes = retry_options.http_status_codes
+        assert codes is not None
         for code in (429, 503, 504):
-            assert code in opts.retry_options.http_status_codes
+            assert code in codes
         for code in (400, 401, 403, 404):  # permanent: retrying can't help
-            assert code not in opts.retry_options.http_status_codes
+            assert code not in codes
 
 
 @pytest.mark.anyio

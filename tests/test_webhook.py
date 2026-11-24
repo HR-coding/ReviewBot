@@ -212,6 +212,23 @@ class TestValidation:
         assert resp.status_code == 400
         assert queued == []
 
+class TestDeliveryHeader:
+    """A signed `pull_request` without `X-GitHub-Delivery` → 400, nothing queued.
+
+    The delivery ID is the dedupe key. With a default like "unknown", every such
+    request would share one ID and all but the first would be dropped silently.
+    """
+
+    def test_missing_delivery_header_returns_400(self, client, sign, opened, queued):
+        # W22 (uses `client` directly: `post_webhook` always sets the header)
+        headers = {"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": sign(opened)}
+
+        resp = client.post("/webhook/github", content=opened, headers=headers)
+
+        assert resp.status_code == 400
+        assert queued == []
+
+
 class TestDeduplication:
     """The background task processes each `X-GitHub-Delivery` ID at most once.
 

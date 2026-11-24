@@ -1,7 +1,7 @@
 import os
 
 # load env variables before imports
-os.environ["WEBHOOK_SECRET"] = "test-secret"
+os.environ["WEBHOOK_SECRET"] = "test-webhook-secret-0123"  # >= 16 chars (config enforces it)
 os.environ["GITHUB_TOKEN"] = "test-token"
 # Never let tests see the real Gemini key from .env: a test that forgets to patch
 # the LLM then fails safely instead of spending quota and sending code to Google.

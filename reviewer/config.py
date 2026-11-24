@@ -1,10 +1,12 @@
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    github_token: SecretStr
-    webhook_secret: SecretStr
+    github_token: SecretStr = Field(min_length=1)
+    # An empty secret would make HMAC signatures forgeable by anyone (the key
+    # is ""), so refuse to start rather than run unprotected.
+    webhook_secret: SecretStr = Field(min_length=16)
     gemini_api_key: SecretStr = SecretStr("")
     # The API model ID (from `client.models.list()`), not the display name.
     # Must be usable on your key's free tier; override with GEMINI_MODEL in .env.

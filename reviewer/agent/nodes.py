@@ -1,5 +1,7 @@
 import logging
 
+import httpx
+import httpx2
 from google import genai
 from google.genai import errors, types
 
@@ -132,6 +134,9 @@ async def review_diff(diff: str) -> str:
         system_instruction=SYSTEM_PROMPT,
         temperature=0.2,  # low: we want consistent findings, not creative writing
         max_output_tokens=MAX_OUTPUT_TOKENS,
+        # We give the model no tools, so turn off automatic function calling
+        # (it also logs "AFC is enabled" on every call).
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
     try:
@@ -148,7 +153,9 @@ async def review_diff(diff: str) -> str:
         # err.message is Google's error text; it never contains the API key.
         logger.error("Gemini API error: status=%s %s", err.code, err.message)
         raise ReviewError(err.message or str(err), status_code=err.code) from err
-    except Exception as err:  # timeouts / network errors from the HTTP layer
+    except (httpx2.HTTPError, httpx.HTTPError, TimeoutError) as err:
+        # Network errors / timeouts (the SDK uses httpx2). Anything else is a bug
+        # in our code: let it propagate so the task logs the full traceback.
         logger.error("Gemini request failed: %s", type(err).__name__)
         raise ReviewError(f"{type(err).__name__}: {err}") from err
 

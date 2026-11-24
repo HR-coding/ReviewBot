@@ -407,6 +407,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "google-genai" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "pydantic-settings" },
     { name = "uvicorn" },
 ]
@@ -422,6 +423,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.165.0" },
     { name = "google-genai", specifier = ">=3.6.1" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "httpx2", specifier = ">=2.16.2" },
     { name = "pydantic-settings", specifier = ">=2.16.3" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]

@@ -55,7 +55,7 @@ async def process_pull_request(delivery_id: str, repo: str, pr_number: int, head
     except ReviewError as exc:
         # LLM review failure due to rate limit issues etc
         PROCESSED_DELIVERIES.discard(delivery_id)
-        logger.error("[%s]LLM Review Failed (status=%s): %s", delivery_id, exc.status_code, exc.message)
+        logger.error("[%s] LLM review failed (status=%s): %s", delivery_id, exc.status_code, exc.message)
 
     except GitHubAPIError as exc:
         # Expected failure (bad token, 404, GitHub down): one clear line, no traceback.
@@ -70,7 +70,7 @@ async def process_pull_request(delivery_id: str, repo: str, pr_number: int, head
 
 @app.post("/webhook/github", status_code=status.HTTP_202_ACCEPTED)
 async def process_github_webhook(request: Request, response: Response, background_tasks: BackgroundTasks, x_hub_signature_256: str | None = Header(default=None),
-                                 x_github_event: str = Header(default="unknown"), x_github_delivery: str = Header(default="unknown")) -> dict[str, str]:
+                                 x_github_event: str = Header(default="unknown"), x_github_delivery: str | None = Header(default=None)) -> dict[str, str]:
     '''Verify, filter and queue a GitHub webhook delivery.
 
     Returns:
@@ -101,6 +101,12 @@ async def process_github_webhook(request: Request, response: Response, backgroun
     if x_github_event != "pull_request":
         logger.info("[%s] Ignoring event=%s", x_github_delivery, x_github_event)
         return {"status": "ignored"}
+
+    # The delivery ID is the dedupe key: without it, every such request would
+    # share one fake ID and all but the first would be dropped as "duplicates".
+    if not x_github_delivery:
+        logger.warning("Rejected pull_request without X-GitHub-Delivery")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing X-GitHub-Delivery header")
 
     # 3. Parse + validate straight from the raw bytes (bad JSON also raises ValidationError).
     try:
