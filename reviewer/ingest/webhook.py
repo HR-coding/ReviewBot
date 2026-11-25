@@ -3,6 +3,7 @@ from reviewer.ingest.github_client import GitHubClient, GitHubAPIError
 from reviewer.config import settings
 from reviewer.ingest.events import PREvent
 from reviewer.agent.nodes import review_diff, ReviewError
+from reviewer.ingest.deduplication import DeliveryStore
 
 import logging
 from fastapi import FastAPI, Request, Response, status, BackgroundTasks, Header, HTTPException
@@ -15,8 +16,11 @@ logger = logging.getLogger(__name__)
 ALLOWED_ACTIONS = {"opened", "synchronize", "reopened"}
 
 
-# In memory cache to store the processed github requests (storing the delivery ids)
-PROCESSED_DELIVERIES : set[str] = set()
+# In-memory store of claimed delivery IDs (lost on restart; see DeliveryStore).
+# GitHub can redeliver a webhook (same X-GitHub-Delivery) for up to 3 days,
+# so remember IDs at least that long.
+DELIVERY_TTL_SECONDS = 3 * 24 * 60 * 60
+PROCESSED_DELIVERIES = DeliveryStore(ttl_seconds=DELIVERY_TTL_SECONDS)
 
 app = FastAPI()
 
@@ -36,10 +40,9 @@ async def process_pull_request(delivery_id: str, repo: str, pr_number: int, head
     Returns:
         None
     '''
-    if delivery_id in PROCESSED_DELIVERIES:
+    if not PROCESSED_DELIVERIES.claim(delivery_id=delivery_id):
         logger.warning("[%s] Duplicate delivery ignored", delivery_id)
         return
-    PROCESSED_DELIVERIES.add(delivery_id)
 
     # On ANY failure, un-mark the delivery so a GitHub "Redeliver" is retried
     # instead of being dropped as a duplicate.
@@ -49,22 +52,24 @@ async def process_pull_request(delivery_id: str, repo: str, pr_number: int, head
         async with GitHubClient(token=token) as gh:
             diff = await gh.get_pr_diff(repo=repo, number=pr_number)            
             review = await review_diff(diff=diff)
-            comment_url = await gh.post_comment(repo=repo, number=pr_number, body=f"### 🤖 Review of {head_sha[:7]}\n\n{review}")
+            # Upsert, not post: one review comment per PR, updated on every push,
+            # and safe to repeat if an earlier POST timed out after succeeding.
+            comment_url = await gh.upsert_comment(repo=repo, number=pr_number, body=f"### 🤖 Review of {head_sha[:7]}\n\n{review}")
         logger.info("[%s] Posted comment on %s#%s: %s", delivery_id, repo, pr_number, comment_url)
 
     except ReviewError as exc:
         # LLM review failure due to rate limit issues etc
-        PROCESSED_DELIVERIES.discard(delivery_id)
+        PROCESSED_DELIVERIES.release(delivery_id=delivery_id)
         logger.error("[%s] LLM review failed (status=%s): %s", delivery_id, exc.status_code, exc.message)
 
     except GitHubAPIError as exc:
         # Expected failure (bad token, 404, GitHub down): one clear line, no traceback.
-        PROCESSED_DELIVERIES.discard(delivery_id)
+        PROCESSED_DELIVERIES.release(delivery_id=delivery_id)
         logger.error("[%s] GitHub API failed (status=%s): %s", delivery_id, exc.status_code, exc.message)
 
     except Exception:
         # Unexpected failure = a bug in our code: log the full traceback.
-        PROCESSED_DELIVERIES.discard(delivery_id)
+        PROCESSED_DELIVERIES.release(delivery_id=delivery_id)
         logger.exception("[%s] Error while processing pull request", delivery_id)
 
 
