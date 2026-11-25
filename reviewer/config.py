@@ -1,5 +1,13 @@
+from pathlib import Path
+
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The project root: this file is <root>/reviewer/config.py, so two levels up.
+# Anchoring .env here (instead of a bare ".env", which pydantic-settings resolves
+# against the CURRENT directory) means the same .env is found no matter where
+# the process is started from: the repo root, scripts/, an IDE, a test runner.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
@@ -14,7 +22,7 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr = SecretStr("")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )

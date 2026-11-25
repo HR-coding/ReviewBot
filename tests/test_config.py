@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -30,3 +32,14 @@ class TestSettings:
         s = Settings(_env_file=None)  # pyright: ignore[reportCallIssue]
 
         assert len(s.webhook_secret.get_secret_value()) >= 16
+
+    def test_env_file_is_anchored_to_the_project_root(self):
+        # C4: a bare ".env" is resolved against the CURRENT directory, so running
+        # from scripts/ found no .env at all. The path must be absolute and point
+        # at <root>/.env, wherever the process starts. (Checks the path only:
+        # tests never load the real .env, which holds real secrets.)
+        env_file = Settings.model_config.get("env_file")
+
+        assert isinstance(env_file, Path)
+        assert env_file.is_absolute()
+        assert env_file == Path(__file__).resolve().parents[1] / ".env"
