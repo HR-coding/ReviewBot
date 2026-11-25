@@ -40,7 +40,7 @@ def client() -> TestClient:
 # runs this fixture before every test automatically without having to pass it as an argument
 @pytest.fixture(autouse=True)
 def _clear_deliveries():
-    """Reset the module-level dedupe set around every test (autouse).
+    """Reset the module-level dedupe store around every test (autouse).
 
     `PROCESSED_DELIVERIES` lives on the module and survives between tests.
     Without this reset, a delivery ID used in one test would make a later test
@@ -129,10 +129,19 @@ def queued(monkeypatch) -> list:
 
 
 class FakeGitHubClient:
+    """Stand-in for `GitHubClient` in the webhook tests.
+
+    `comments_upserted` records every `upsert_comment` call (repo, number, body).
+    How an upsert becomes PATCH vs POST is tested in test_github_client.py;
+    here we only check that the task calls it with the right arguments.
+    It has no `post_comment` on purpose: if the task went back to plain POSTs,
+    the call would fail and the tests would catch it.
+    """
+
     def __init__(self) -> None:
         self.diff_to_return = "diff --git a/a.py b/a.py\n+new line\n"
         self.error_to_raise: Exception | None = None
-        self.comments_posted: list[tuple[str, int, str]] = []
+        self.comments_upserted: list[tuple[str, int, str]] = []
 
     def __call__(self, token: str, **kwargs) -> "FakeGitHubClient":
         # Allows FakeGitHubClient instance to act as the GitHubClient(...) constructor
@@ -149,8 +158,8 @@ class FakeGitHubClient:
             raise self.error_to_raise
         return self.diff_to_return
 
-    async def post_comment(self, repo: str, number: int, body: str) -> str:
-        self.comments_posted.append((repo, number, body))
+    async def upsert_comment(self, repo: str, number: int, body: str) -> str:
+        self.comments_upserted.append((repo, number, body))
         return f"https://github.com/{repo}/pull/{number}#issuecomment-1"
 
 
