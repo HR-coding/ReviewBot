@@ -263,7 +263,7 @@ class TestDeduplication:
         assert count_logs(caplog, f"[{delivery}] Reviewing") == 1
         assert count_logs(caplog, f"[{delivery}] Duplicate delivery ignored") == 1
         # The side effect that matters: exactly one comment on the PR.
-        assert len(fake_github.comments_posted) == 1
+        assert len(fake_github.comments_upserted) == 1
 
     def test_distinct_deliveries_both_process(self, post_webhook, opened, caplog, fake_github, fake_review):
         caplog.set_level(logging.INFO, logger="reviewer.ingest.webhook")
@@ -277,7 +277,9 @@ class TestDeduplication:
         assert count_logs(caplog, f"[{delivery_1}] Reviewing") == 1
         assert count_logs(caplog, f"[{delivery_2}] Reviewing") == 1
         assert count_logs(caplog, "Duplicate delivery ignored") == 0
-        assert len(fake_github.comments_posted) == 2
+        # Two upserts. On GitHub that's still ONE comment, updated twice: the
+        # client finds its own comment and PATCHes it (test_github_client.py U2).
+        assert len(fake_github.comments_upserted) == 2
 
     def test_failed_delivery_is_retried(self, post_webhook, opened, caplog, fake_github, fake_review):
         # GitHub's API fails → the task must un-mark the delivery ID, so when
@@ -293,7 +295,7 @@ class TestDeduplication:
         assert count_logs(caplog, f"[{delivery}] Reviewing") == 2
         assert count_logs(caplog, f"[{delivery}] Duplicate delivery ignored") == 0
         assert count_logs(caplog, f"[{delivery}] GitHub API failed (status=500)") == 2
-        assert fake_github.comments_posted == []  # the diff fetch failed, so nothing posted
+        assert fake_github.comments_upserted == []  # the diff fetch failed, so nothing posted
         assert delivery not in webhook.PROCESSED_DELIVERIES
 
 
@@ -315,8 +317,8 @@ class TestPostedComment:
         # The diff fetched from GitHub is exactly what the LLM reviewed.
         assert fake_review.diffs_reviewed == [fake_github.diff_to_return]
         # The LLM's output is what was posted, on this PR, labelled with the commit.
-        assert len(fake_github.comments_posted) == 1
-        repo, number, body = fake_github.comments_posted[0]
+        assert len(fake_github.comments_upserted) == 1
+        repo, number, body = fake_github.comments_upserted[0]
         assert repo == payload["repository"]["full_name"]
         assert number == payload["number"]
         assert fake_review.review_to_return in body
@@ -334,5 +336,5 @@ class TestPostedComment:
         assert count_logs(caplog, f"[{delivery}] Reviewing") == 2
         assert count_logs(caplog, f"[{delivery}] Duplicate delivery ignored") == 0
         assert count_logs(caplog, "status=429") == 2
-        assert fake_github.comments_posted == []
+        assert fake_github.comments_upserted == []
         assert delivery not in webhook.PROCESSED_DELIVERIES
